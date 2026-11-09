@@ -1,0 +1,8 @@
+# Ignore local environment and generated data
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+/data/
+*.log

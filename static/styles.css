@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Viral Clipper</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Viral Clipper</h1>
+        <p>Upload a video or submit a URL to find the moments most likely to perform as clips.</p>
+      </header>
+
+      <section class="panel">
+        <form id="jobForm" enctype="multipart/form-data">
+          <div class="field">
+            <label for="file">Upload video</label>
+            <input id="file" name="file" type="file" accept="video/*" />
+          </div>
+
+          <div class="field">
+            <label for="url">Or paste video URL</label>
+            <input id="url" name="url" type="url" placeholder="https://example.com/video.mp4" />
+          </div>
+
+          <div class="row">
+            <div class="field small">
+              <label for="max_clips">Max clips</label>
+              <input id="max_clips" name="max_clips" type="number" value="3" min="1" max="10" />
+            </div>
+            <div class="field small">
+              <label for="timezone">Timezone</label>
+              <input id="timezone" name="timezone" type="text" value="UTC" />
+            </div>
+          </div>
+
+          <div class="field checkbox-row">
+            <input id="i_have_rights" name="i_have_rights" type="checkbox" />
+            <label for="i_have_rights">I have rights to this video</label>
+          </div>
+
+          <div class="field">
+            <label for="password">App password (if configured)</label>
+            <input id="password" name="password" type="password" placeholder="Optional password" />
+          </div>
+
+          <button type="submit">Create job</button>
+        </form>
+      </section>
+
+      <section id="status" class="panel hidden">
+        <h2>Job status</h2>
+        <pre id="jobOutput"></pre>
+      </section>
+    </main>
+
+    <script>
+      const form = document.getElementById('jobForm');
+      const outputEl = document.getElementById('jobOutput');
+      const statusEl = document.getElementById('status');
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const formData = new FormData(form);
+        const response = await fetch('/jobs', { method: 'POST', body: formData });
+        const data = await response.json();
+
+        statusEl.classList.remove('hidden');
+        outputEl.textContent = JSON.stringify(data, null, 2);
+
+        if (response.ok && data.job_id) {
+          const poll = async () => {
+            const pollRes = await fetch(`/jobs/${data.job_id}`);
+            const pollData = await pollRes.json();
+            outputEl.textContent = JSON.stringify(pollData, null, 2);
+            if (pollData.status !== 'done') {
+              setTimeout(poll, 1500);
+            }
+          };
+          poll();
+        }
+      });
+    </script>
+  </body>
+</html>

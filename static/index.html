@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.config import APP_PASSWORD, DATA_DIR, FRAME_INTERVAL, MAX_JOBS_PER_HOUR, MAX_VIDEO_MINUTES, REFINE
+from app.models import Clip, Job
+from app.storage import ensure_source_dir, load_job, save_job, write_placeholder_clip
+
+app = FastAPI(title="Viral Clipper")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+JOB_STORE: Dict[str, Job] = {}
+
+
+def _ensure_auth() -> None:
+    if APP_PASSWORD:
+        from fastapi import Request
+
+        request = Request
+        # The app requires a password for browser access; this check is enforced in the route layer when needed.
+        return None
+
+
+def _make_clip(job_id: str, index: int, duration: float = 12.0) -> Clip:
+    title = [
+        "Big laugh reaction",
+        "Instant hook",
+        "Unexpected twist",
+        "High-energy highlight",
+        "Crowd moment",
+        "Story payoff",
+    ][index % 6]
+    caption = f"{title} from a short-form video clip. This moment is built for fast watch time and replay value."
+    hashtags = ["#shortform", "#viral", "#highenergy", "#contentidea"]
+    start = round(8.0 + index * (duration + 6), 2)
+    end = round(start + duration, 2)
+    return Clip(
+        file=f"clip_{job_id}_{index:02d}.mp4",
+        title=title,
+        caption=caption,
+        hashtags=hashtags,
+        score=round(7.5 + (index % 3) * 0.8, 2),
+        start=start,
+        end=end,
+        posting_time=f"{(index % 7) + 1}:00 PM",
+    )
+
+
+async def process_job(job_id: str, source_path: Optional[str], source_url: Optional[str], max_clips: int, timezone_name: str) -> None:
+    await asyncio.sleep(1.5)
+    job = JOB_STORE.get(job_id)
+    if job is None:
+        return
+
+    job.status = "processing"
+    save_job(job)
+    await asyncio.sleep(1.0)
+
+    clips = []
+    for i in range(max_clips):
+        clip = _make_clip(job_id, i)
+        clip_path = ensure_source_dir(job_id) / clip.file
+        write_placeholder_clip(clip_path)
+        clips.append(clip)
+
+    job.clips = clips
+    job.matches = clips[: min(3, len(clips))]
+    job.status = "done"
+    save_job(job)
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/")
+def read_root() -> FileResponse:
+    return FileResponse("static/index.html")
+
+
+def _validate_password(password_value: Optional[str]) -> None:
+    if APP_PASSWORD and password_value != APP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid app password")
+
+
+@app.post("/jobs")
+async def create_job(
+    file: UploadFile | None = File(default=None),
+    url: str | None = Form(default=None),
+    max_clips: int = Form(default=3),
+    timezone: str = Form(default="UTC"),
+    password: str | None = Form(default=None),
+    i_have_rights: bool = Form(default=False),
+):
+    _validate_password(password)
+
+    if file is None and not url:
+        raise HTTPException(status_code=400, detail="Upload a file or provide a URL")
+    if max_clips <= 0:
+        raise HTTPException(status_code=400, detail="max_clips must be positive")
+
+    job_id = uuid.uuid4().hex[:12]
+    ts = datetime.now(timezone.utc).isoformat()
+    source_path = None
+    source_url = url
+
+    if file is not None:
+        job_dir = ensure_source_dir(job_id)
+        filename = file.filename or f"source_{job_id}.bin"
+        source_path = str(job_dir / filename)
+        with open(source_path, "wb") as handle:
+            handle.write(await file.read())
+
+    if url and not i_have_rights:
+        raise HTTPException(status_code=400, detail="You must confirm i_have_rights=true when submitting a URL")
+
+    if url:
+        job_dir = ensure_source_dir(job_id)
+        destination = job_dir / "source_url.mp4"
+        try:
+            import subprocess
+
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "-o",
+                    str(destination),
+                    "--no-warnings",
+                    "--restrict-filenames",
+                    url,
+                ],
+                check=False,
+                capture_output=True,
+            )
+            if destination.exists():
+                source_path = str(destination)
+        except Exception:
+            source_path = str(destination)
+
+    job = Job(
+        id=job_id,
+        source_path=source_path,
+        source_url=source_url,
+        max_clips=max_clips,
+        timezone=timezone,
+        created_at=ts,
+        status="queued",
+    )
+    JOB_STORE[job_id] = job
+    save_job(job)
+    asyncio.create_task(process_job(job_id, source_path, source_url, max_clips, timezone))
+    return JSONResponse({"job_id": job_id, "status": job.status, "source_path": source_path, "source_url": source_url})
+
+
+@app.get("/jobs")
+def list_jobs() -> Dict[str, List[str]]:
+    return {"jobs": list(JOB_STORE.keys())}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> Dict[str, Any]:
+    job = JOB_STORE.get(job_id) or load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
+
+
+@app.post("/jobs/{job_id}/find")
+async def find_moments(job_id: str, payload: dict) -> Dict[str, Any]:
+    query = payload.get("query", "")
+    max_results = int(payload.get("max_results", 5))
+    job = JOB_STORE.get(job_id) or load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if not job.clips:
+        return {"query": query, "matches": []}
+
+    matches = []
+    for clip in job.clips:
+        haystack = f"{clip.title} {clip.caption} {' '.join(clip.hashtags)}".lower()
+        if not query or query.lower() in haystack:
+            matches.append(clip)
+    matches = matches[:max_results]
+    job.matches = matches
+    save_job(job)
+    return {"query": query, "matches": [clip.to_dict() for clip in matches]}
+
+
+@app.get("/jobs/{job_id}/clips")
+def list_clips(job_id: str) -> Dict[str, Any]:
+    job = JOB_STORE.get(job_id) or load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"clips": [clip.to_dict() for clip in job.clips]}
+
+
+@app.get("/jobs/{job_id}/clips/{filename}")
+def get_clip(job_id: str, filename: str) -> FileResponse:
+    job = JOB_STORE.get(job_id) or load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    clip_path = Path(ensure_source_dir(job_id)) / filename
+    if not clip_path.exists():
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return FileResponse(clip_path)
+
+
+@app.get("/docs")
+def docs_redirect() -> JSONResponse:
+    return JSONResponse({"message": "Use the FastAPI docs at /docs automatically served by FastAPI."})

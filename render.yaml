@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: viral-clipper
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: clipper-data
+      mountPath: /data
+      sizeGB: 20
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        value: /data
